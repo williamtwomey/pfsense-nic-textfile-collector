@@ -1,0 +1,75 @@
+# Example Prometheus alert rules for pfSense multi-WAN failover, driven by the
+# metrics from gateway_collector.sh (gateways.prom).
+#
+# Adjust the gateway="..." label values to match YOUR gateway names (as shown in
+# node_gateway_info / pfSense System > Routing > Gateways) and the `job`/instance
+# selectors to match your scrape config.
+#
+# Failover vs failback: a single alert covers both. The alert FIRING is the
+# failover; its RESOLUTION is the failback. With Alertmanager's default
+# send_resolved: true you get a notification for each direction from one rule.
+
+groups:
+  - name: pfsense-wan-failover
+    rules:
+      # --- Failover / failback -------------------------------------------------
+      # Fires while the primary WAN is NOT the active default route (i.e. we are
+      # running on a backup). Resolves when traffic returns to the primary.
+      - alert: WANNotOnPrimary
+        expr: node_gateway_default{gateway="WAN_DHCP"} == 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "pfSense is NOT on the primary WAN"
+          description: >-
+            Default route has moved off WAN_DHCP. Active default gateway:
+            {{ with query "node_gateway_default == 1" }}{{ range . }}{{ .Labels.gateway }}{{ end }}{{ end }}.
+            Firing = failover; resolved = back on primary.
+
+      # Optional: an explicit, separate object for "running on the backup" so you
+      # can route/annotate it differently (e.g. page vs. notify). Same signal,
+      # phrased from the backup's side.
+      - alert: WANUsingBackup
+        expr: node_gateway_default{gateway="BACKUP"} == 1
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "pfSense failed over to BACKUP WAN"
+          description: "BACKUP now owns the default route; primary WAN_DHCP is unavailable."
+
+  - name: pfsense-wan-health
+    rules:
+      # Backup path is dead WHILE we're still on primary -> failover would have
+      # nowhere to go. Worth knowing before you actually need it.
+      - alert: BackupWANUnavailable
+        expr: node_gateway_up{gateway="BACKUP"} == 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Backup WAN is unreachable"
+          description: "BACKUP gateway monitor reports 100% loss; the failover path is down."
+
+      # Early warning: primary degrading (matches dpinger's default 20% loss alarm)
+      # before it fully trips a failover.
+      - alert: PrimaryWANLossHigh
+        expr: node_gateway_loss_ratio{gateway="WAN_DHCP"} > 0.2
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Primary WAN packet loss high"
+          description: "WAN_DHCP loss {{ $value | humanizePercentage }} over the monitor target."
+
+      # The collector stopped publishing (cron died, node_exporter textfile issue,
+      # box down). Without this, a silent collector looks like "all healthy".
+      - alert: GatewayCollectorStale
+        expr: absent(node_gateway_info)
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "pfSense gateway_collector metrics missing"
+          description: "node_gateway_info has been absent for 5m - check the cron job / node_exporter textfile dir."
